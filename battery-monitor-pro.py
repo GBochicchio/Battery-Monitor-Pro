@@ -1,12 +1,15 @@
 import psutil
 import tkinter as tk
-import threading
 import time
 from datetime import datetime
 import argparse
 import logging
 import sys
-import math
+import json
+import threading
+from pathlib import Path
+import pystray
+from PIL import Image, ImageDraw
 
 # ========== CONFIGURAZIONI ==========
 DEFAULT_MIN_THRESHOLD = 20          # Soglia minima percentuale
@@ -21,6 +24,42 @@ TIMEOUT_BATTERIA_CRITICA = 0       # Mai auto-chiudi se <15%
 AUTO_CLOSE_ON_POWER_CHANGE = True  # Chiudi se cambia alimentazione
 POWER_CHECK_INTERVAL = 2           # Controlla alimentazione ogni 2 secondi
 
+# ========== CONFIG FILE ==========
+CONFIG_PATH = Path.home() / ".battery_monitor.json"
+
+CONFIG_DEFAULTS = {
+    "min_threshold": DEFAULT_MIN_THRESHOLD,
+    "max_threshold": DEFAULT_MAX_THRESHOLD,
+    "check_interval": DEFAULT_CHECK_INTERVAL,
+    "progressive_step": PROGRESSIVE_REMINDER_STEP,
+    "timeout_charged": TIMEOUT_BATTERIA_CARICA,
+    "timeout_discharged": TIMEOUT_BATTERIA_SCARICA,
+    "timeout_critical": TIMEOUT_BATTERIA_CRITICA,
+    "auto_close_on_power_change": AUTO_CLOSE_ON_POWER_CHANGE,
+    "power_check_interval": POWER_CHECK_INTERVAL,
+}
+
+def load_config() -> dict:
+    """Carica config da file JSON; riempie le chiavi mancanti con i default"""
+    cfg = dict(CONFIG_DEFAULTS)
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg.update({k: v for k, v in saved.items() if k in cfg})
+        except Exception as e:
+            logger.warning(f"Impossibile leggere il config file, uso default: {e}")
+    return cfg
+
+def save_config(cfg: dict) -> None:
+    """Salva config su file JSON"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logger.info(f"Configurazione salvata in {CONFIG_PATH}")
+    except Exception as e:
+        logger.error(f"Impossibile salvare il config file: {e}")
+
 # Configurazione del logging
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +72,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ModernBatteryPopup:
-    def __init__(self):
+    def __init__(self, on_snooze=None):
         self.root = None
         self.popup_attiva = False
         self.animazione_attiva = False
@@ -45,6 +84,7 @@ class ModernBatteryPopup:
         self.countdown_job = None
         self.power_monitor_job = None
         self.animation_job = None
+        self.on_snooze = on_snooze
     
     def mostra_popup_batteria_scarica(self, percentuale, tempo_rimasto="N/A"):
         """Mostra popup moderno per batteria scarica"""
@@ -88,7 +128,7 @@ class ModernBatteryPopup:
         try:
             battery = psutil.sensors_battery()
             return battery.power_plugged if battery else None
-        except:
+        except Exception:
             return None
     
     def cancel_scheduled_jobs(self):
@@ -202,7 +242,7 @@ class ModernBatteryPopup:
         if tipo == "carica":
             timeout = TIMEOUT_BATTERIA_CARICA
         elif tipo == "scarica":
-            if percentuale <= 15:
+            if percentuale <= 10:
                 timeout = TIMEOUT_BATTERIA_CRITICA
             else:
                 timeout = TIMEOUT_BATTERIA_SCARICA
@@ -421,26 +461,26 @@ class ModernBatteryPopup:
         barra_frame = tk.Frame(parent, bg='#1a1a1a')
         barra_frame.pack(fill='x', pady=(0, 5))
         
-        canvas = tk.Canvas(barra_frame, height=16, bg='#333333', highlightthickness=0)
+        canvas = tk.Canvas(barra_frame, height=28, bg='#333333', highlightthickness=0)
         canvas.pack(fill='x', padx=10)
-        
-        # Larghezza totale disponibile
+
+        # Larghezza reale del canvas dopo il rendering
         canvas.update()
-        canvas_width = 430  # Larghezza approssimativa
-        
-        # Barra di progresso principale
+        canvas_width = canvas.winfo_width() or 430
+
+        # Barra di progresso principale (nella metà inferiore del canvas)
         larghezza_barra = int((percentuale / 100) * canvas_width)
-        canvas.create_rectangle(2, 2, larghezza_barra, 14, fill=colore, outline="")
-        
+        canvas.create_rectangle(2, 14, larghezza_barra, 26, fill=colore, outline="")
+
         # Indicatore soglia massima (solo per batteria carica)
         if soglia_max:
             soglia_x = int((soglia_max / 100) * canvas_width)
-            canvas.create_line(soglia_x, 0, soglia_x, 16, fill='#ffffff', width=2)
-            canvas.create_text(soglia_x, -8, text=f"{soglia_max}%", fill='#ffffff', 
-                             font=("Segoe UI", 8), anchor='s')
-        
+            canvas.create_line(soglia_x, 12, soglia_x, 28, fill='#ffffff', width=2)
+            canvas.create_text(soglia_x, 6, text=f"{soglia_max}%", fill='#ffffff',
+                             font=("Segoe UI", 8), anchor='center')
+
         # Bordo della barra
-        canvas.create_rectangle(1, 1, canvas_width-1, 15, outline='#555555', width=1, fill='')
+        canvas.create_rectangle(1, 13, canvas_width-1, 27, outline='#555555', width=1, fill='')
     
     def crea_pulsanti_moderni(self, parent, colore_accento, tipo, urgency_level):
         """Crea pulsanti con design moderno"""
@@ -538,57 +578,42 @@ class ModernBatteryPopup:
         """Effetto speciale per situazioni critiche"""
         if not self.root:
             return
-        
-        def pulse():
-            try:
-                if not self.popup_attiva or not self.animazione_attiva:
-                    return
-                    
-                if not self.root or not self.root.winfo_exists():
-                    self.animazione_attiva = False
-                    return
-                
-                # Effetto pulsante
-                for alpha in [1.0, 0.7, 1.0]:
-                    if self.popup_attiva and self.root and self.root.winfo_exists():
-                        self.root.attributes('-alpha', alpha)
-                        self.root.update()
-                        time.sleep(0.3)
-                    else:
-                        self.animazione_attiva = False
-                        return
-                
-                if self.animazione_attiva and self.popup_attiva and self.root and self.root.winfo_exists():
-                    self.animation_job = self.root.after(2000, pulse)
-                    
-            except Exception as e:
-                self.animazione_attiva = False
-                logger.error(f"Animazione pulse fermata: {e}")
-        
         self.animazione_attiva = True
-        if self.root:
-            self.animation_job = self.root.after(1000, pulse)
+        self._pulse_step([1.0, 0.7, 1.0])
+
+    def _pulse_step(self, alphas):
+        """Singolo step del pulse critico, eseguito tramite after() senza bloccare il mainloop"""
+        if not self.popup_attiva or not self.animazione_attiva:
+            return
+        if not self.root or not self.root.winfo_exists():
+            self.animazione_attiva = False
+            return
+        try:
+            self.root.attributes('-alpha', alphas[0])
+            if len(alphas) > 1:
+                self.animation_job = self.root.after(300, lambda: self._pulse_step(alphas[1:]))
+            else:
+                # Ciclo completato: aspetta 2 secondi e riparte
+                if self.animazione_attiva:
+                    self.animation_job = self.root.after(2000, lambda: self._pulse_step([1.0, 0.7, 1.0]))
+        except Exception as e:
+            self.animazione_attiva = False
+            logger.error(f"Animazione pulse fermata: {e}")
     
     def animazione_entrata(self):
         """Animazione di entrata della finestra"""
         if not self.root:
             return
-        
         self.root.attributes('-alpha', 0.0)
-        
-        for i in range(1, 21):
-            if not self.root or not self.root.winfo_exists():
-                break
-            
-            alpha = i / 20.0
-            self.root.attributes('-alpha', alpha)
-            
-            if i < 20:
-                self.root.update()
-                time.sleep(0.02)
-        
-        if self.root and self.root.winfo_exists():
-            self.root.attributes('-alpha', 1.0)
+        self._fade_step(1)
+
+    def _fade_step(self, step):
+        """Singolo step del fade-in, eseguito tramite after() senza bloccare il mainloop"""
+        if not self.root or not self.root.winfo_exists():
+            return
+        self.root.attributes('-alpha', step / 20.0)
+        if step < 20:
+            self.root.after(20, lambda: self._fade_step(step + 1))
     
     def centra_finestra(self):
         """Centra la finestra sullo schermo"""
@@ -637,16 +662,128 @@ class ModernBatteryPopup:
     
     def snooze_popup(self):
         """Posticipa il popup di 5 minuti"""
+        if self.on_snooze:
+            self.on_snooze(5)
         logger.info("Popup posticipato di 5 minuti")
         self.chiudi_popup()
+
+class BatteryTray:
+    """Gestisce l'icona nel system tray e il suo menu contestuale"""
+
+    def __init__(self, monitor):
+        self.monitor = monitor
+        self.icon = None
+        self._last_percent = 50
+        self._last_plugged = False
+
+    def _create_icon_image(self, percent: int, plugged: bool) -> Image.Image:
+        """Genera un'icona batteria 64x64 con PIL"""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Corpo batteria
+        draw.rectangle([6, 14, 58, 58], outline="white", width=3)
+        # Puntale superiore
+        draw.rectangle([22, 8, 42, 14], fill="white")
+
+        # Colore riempimento
+        if plugged:
+            color = "#5352ed"  # viola = in carica
+        elif percent > 40:
+            color = "#2ed573"  # verde
+        elif percent > 20:
+            color = "#ffa502"  # arancio
+        else:
+            color = "#ff4757"  # rosso critico
+
+        # Rettangolo di riempimento (dal basso verso l'alto)
+        fill_h = max(1, int((percent / 100) * 40))
+        draw.rectangle([10, 54 - fill_h, 54, 54], fill=color)
+
+        # Fulmine se in carica
+        if plugged:
+            pts = [(32, 16), (26, 34), (31, 34), (28, 56), (38, 30), (33, 30)]
+            draw.polygon(pts, fill="white")
+
+        return img
+
+    def _build_menu(self) -> pystray.Menu:
+        return pystray.Menu(
+            pystray.MenuItem("Monitor Batteria", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                lambda _: "⏸ Pausa" if not self.monitor.paused else "▶ Riprendi",
+                self._toggle_pausa,
+            ),
+            pystray.MenuItem("Impostazioni...", self._apri_impostazioni),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Esci", self._esci),
+        )
+
+    def _toggle_pausa(self, icon, item):
+        self.monitor.paused = not self.monitor.paused
+        stato = "in pausa" if self.monitor.paused else "ripreso"
+        logger.info(f"Monitor {stato} dal tray")
+
+    def _apri_impostazioni(self, icon, item):
+        self.monitor.show_settings = True
+
+    def _esci(self, icon, item):
+        logger.info("Uscita richiesta dal tray")
+        self.monitor.stop()
+        icon.stop()
+
+    def start(self):
+        """Avvia il tray icon in un daemon thread"""
+        img = self._create_icon_image(self._last_percent, self._last_plugged)
+        self.icon = pystray.Icon(
+            "BatteryMonitor",
+            img,
+            title="Monitor Batteria",
+            menu=self._build_menu(),
+        )
+        t = threading.Thread(target=self.icon.run, daemon=True)
+        t.start()
+        logger.info("System tray avviato")
+
+    def update(self, percent: int, plugged: bool):
+        """Aggiorna icona e tooltip con lo stato attuale della batteria"""
+        if not self.icon:
+            return
+        self._last_percent = percent
+        self._last_plugged = plugged
+        try:
+            self.icon.icon = self._create_icon_image(percent, plugged)
+            stato = "In carica" if plugged else "Scarica"
+            self.icon.title = f"Batteria: {percent}% ({stato})"
+        except Exception as e:
+            logger.debug(f"Aggiornamento tray icon fallito: {e}")
+
+    def stop(self):
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
 
 class BatteryMonitor:
     def __init__(self, soglia_min, soglia_max, intervallo):
         self.soglia_min = soglia_min
         self.soglia_max = soglia_max
         self.intervallo = intervallo
-        self.ultimo_avviso_carica = 0  # Traccia l'ultima percentuale per cui abbiamo mostrato un avviso
+        self.ultimo_avviso_carica = 0
+        self.snooze_until = 0.0
         self.running = True
+        self.paused = False
+        self.show_settings = False
+        self.tray = None          # BatteryTray, iniettato da main()
+        self._last_battery = None  # Ultima lettura {percentuale, alimentazione}
+
+    def attiva_snooze(self, minuti=5):
+        """Blocca i controlli batteria per i prossimi N minuti"""
+        self.snooze_until = time.time() + (minuti * 60)
+        logger.info(f"Snooze attivato: prossimo controllo tra {minuti} minuti")
         
     def get_battery_info(self):
         """Ottiene le informazioni sulla batteria"""
@@ -694,13 +831,18 @@ class BatteryMonitor:
     
     def controlla_batteria(self):
         """Controlla lo stato della batteria e mostra popup se necessario"""
+        if time.time() < self.snooze_until:
+            logger.info("Controllo batteria saltato (snooze attivo)")
+            return
+
         info_batteria = self.get_battery_info()
         if info_batteria is None:
             return
         
-        percentuale = info_batteria["percentuale"]
+        percentuale = int(info_batteria["percentuale"])
         alimentazione = info_batteria["alimentazione"]
         tempo_rimasto = self.formatta_tempo_rimasto(info_batteria["tempo_rimasto"])
+        self._last_battery = {"percentuale": percentuale, "alimentazione": alimentazione}
         
         stato = "In carica" if alimentazione else "Non in carica"
         logger.info(f"Stato batteria: {percentuale}% - {stato} - Tempo rimasto: {tempo_rimasto}")
@@ -708,63 +850,127 @@ class BatteryMonitor:
         # Controllo per batteria scarica
         if not alimentazione and percentuale <= self.soglia_min:
             logger.warning(f"Batteria sotto la soglia minima: {percentuale}%")
-            popup = ModernBatteryPopup()
+            popup = ModernBatteryPopup(on_snooze=self.attiva_snooze)
             popup.mostra_popup_batteria_scarica(percentuale, tempo_rimasto)
-        
+
         # Controllo per batteria carica con promemoria progressivi
         elif self.dovrebbe_mostrare_popup_carica(percentuale, alimentazione):
             steps_over = (percentuale - self.soglia_max) // PROGRESSIVE_REMINDER_STEP
             logger.warning(f"Batteria sopra la soglia massima: {percentuale}% (step {steps_over + 1})")
-            popup = ModernBatteryPopup()
+            popup = ModernBatteryPopup(on_snooze=self.attiva_snooze)
             popup.mostra_popup_batteria_carica(percentuale, self.soglia_max)
     
+    def _apri_dialogo_impostazioni(self):
+        """Finestra modale (tkinter, main thread) per modificare soglie e intervallo"""
+        root = tk.Tk()
+        root.title("Impostazioni Monitor Batteria")
+        root.geometry("340x220")
+        root.resizable(False, False)
+        root.configure(bg="#1a1a1a")
+        root.lift()
+        root.attributes("-topmost", True)
+
+        # Centra la finestra
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - 340) // 2
+        y = (root.winfo_screenheight() - 220) // 2
+        root.geometry(f"340x220+{x}+{y}")
+
+        lbl_style = {"bg": "#1a1a1a", "fg": "white", "font": ("Segoe UI", 10)}
+        entry_style = {"bg": "#2d2d2d", "fg": "white", "font": ("Segoe UI", 10),
+                       "insertbackground": "white", "bd": 0, "width": 8}
+
+        def row(r, label, default):
+            tk.Label(root, text=label, **lbl_style).grid(row=r, column=0, sticky="w", padx=20, pady=8)
+            var = tk.StringVar(value=str(default))
+            entry = tk.Entry(root, textvariable=var, **entry_style)
+            entry.grid(row=r, column=1, padx=10, pady=8)
+            return var
+
+        var_min = row(0, "Soglia minima (%)", self.soglia_min)
+        var_max = row(1, "Soglia massima (%)", self.soglia_max)
+        var_int = row(2, "Intervallo (secondi)", self.intervallo)
+
+        saved = {"ok": False}
+
+        def salva():
+            try:
+                new_min = int(var_min.get())
+                new_max = int(var_max.get())
+                new_int = int(var_int.get())
+                if not (1 <= new_min <= 99): raise ValueError("min fuori range")
+                if not (1 <= new_max <= 100): raise ValueError("max fuori range")
+                if new_min >= new_max: raise ValueError("min >= max")
+                if new_int < 10: raise ValueError("intervallo troppo basso")
+                self.soglia_min = new_min
+                self.soglia_max = new_max
+                self.intervallo = new_int
+                self.ultimo_avviso_carica = 0  # resetta tracker al cambio soglia
+                saved["ok"] = True
+                root.destroy()
+            except ValueError as e:
+                tk.Label(root, text=f"Errore: {e}", bg="#1a1a1a", fg="#ff4757",
+                         font=("Segoe UI", 9)).grid(row=4, column=0, columnspan=2, pady=4)
+
+        btn_frame = tk.Frame(root, bg="#1a1a1a")
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=12)
+        tk.Button(btn_frame, text="Salva", bg="#2ed573", fg="white", bd=0,
+                  font=("Segoe UI", 10, "bold"), padx=20, pady=6,
+                  cursor="hand2", command=salva).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="Annulla", bg="#404040", fg="#cccccc", bd=0,
+                  font=("Segoe UI", 10), padx=20, pady=6,
+                  cursor="hand2", command=root.destroy).pack(side="left", padx=8)
+
+        root.bind("<Return>", lambda e: salva())
+        root.bind("<Escape>", lambda e: root.destroy())
+        root.mainloop()
+
+        if saved["ok"]:
+            cfg = load_config()
+            cfg["min_threshold"] = self.soglia_min
+            cfg["max_threshold"] = self.soglia_max
+            cfg["check_interval"] = self.intervallo
+            save_config(cfg)
+            logger.info(f"Nuove impostazioni: min={self.soglia_min}% max={self.soglia_max}% intervallo={self.intervallo}s")
+
     def run(self):
         """Esegue il monitoraggio della batteria"""
         logger.info(f"Monitor batteria avviato - Soglie: {self.soglia_min}%-{self.soglia_max}% - Intervallo: {self.intervallo}s")
-        logger.info(f"Promemoria progressivi: ogni {PROGRESSIVE_REMINDER_STEP}% sopra {self.soglia_max}%")
-        
-        try:
-            while self.running:
+        logger.info(f"Promemoria progressivi: ogni PROGRESSIVE_REMINDER_STEP% sopra {self.soglia_max}%")
+
+        while self.running:
+            # Apertura dialogo impostazioni richiesta dal tray (deve stare nel main thread)
+            if self.show_settings:
+                self.show_settings = False
+                self._apri_dialogo_impostazioni()
+
+            if not self.paused:
                 self.controlla_batteria()
-                time.sleep(self.intervallo)
-        except KeyboardInterrupt:
-            logger.info("Monitor di batteria arrestato dall'utente")
-        except Exception as e:
-            logger.error(f"Errore imprevisto: {e}")
+                if self.tray and self._last_battery:
+                    self.tray.update(
+                        self._last_battery["percentuale"],
+                        self._last_battery["alimentazione"],
+                    )
+
+            time.sleep(self.intervallo)
     
     def stop(self):
         """Ferma il monitoraggio"""
         self.running = False
 
 def parse_arguments():
-    """Gestisce gli argomenti da linea di comando"""
+    """Gestisce gli argomenti da linea di comando.
+    I default sono None: se non specificati, i valori vengono presi dal config file."""
     parser = argparse.ArgumentParser(description='Monitor di batteria con popup moderni')
-    parser.add_argument('--min', type=int, default=DEFAULT_MIN_THRESHOLD,
-                        help=f'Soglia minima percentuale (default: {DEFAULT_MIN_THRESHOLD})')
-    parser.add_argument('--max', type=int, default=DEFAULT_MAX_THRESHOLD,
-                        help=f'Soglia massima percentuale (default: {DEFAULT_MAX_THRESHOLD})')
-    parser.add_argument('--interval', type=int, default=DEFAULT_CHECK_INTERVAL,
-                        help=f'Intervallo di controllo in secondi (default: {DEFAULT_CHECK_INTERVAL})')
+    parser.add_argument('--min', type=int, default=None,
+                        help=f'Soglia minima percentuale (default dal config: {DEFAULT_MIN_THRESHOLD})')
+    parser.add_argument('--max', type=int, default=None,
+                        help=f'Soglia massima percentuale (default dal config: {DEFAULT_MAX_THRESHOLD})')
+    parser.add_argument('--interval', type=int, default=None,
+                        help=f'Intervallo di controllo in secondi (default dal config: {DEFAULT_CHECK_INTERVAL})')
     parser.add_argument('--test', action='store_true',
                         help='Esegue una demo dei popup senza monitoraggio continuo')
-    
-    args = parser.parse_args()
-    
-    # Validazione
-    if not 1 <= args.min <= 99:
-        logger.error("La soglia minima deve essere tra 1 e 99")
-        sys.exit(1)
-    if not 1 <= args.max <= 100:
-        logger.error("La soglia massima deve essere tra 1 e 100")
-        sys.exit(1)
-    if args.min >= args.max:
-        logger.error("La soglia minima deve essere inferiore alla soglia massima")
-        sys.exit(1)
-    if args.interval < 10:
-        logger.error("L'intervallo di controllo deve essere almeno 10 secondi")
-        sys.exit(1)
-        
-    return args
+    return parser.parse_args()
 
 def test_demo():
     """Esegue una demo completa dei popup con gestione migliorata degli errori"""
@@ -836,13 +1042,39 @@ def mostra_configurazione(args):
 def main():
     """Funzione principale"""
     args = parse_arguments()
-    
+
     if args.test:
         test_demo()
         return
-    
-    mostra_configurazione(args)
-    
+
+    # Carica config file e applica override da CLI
+    cfg = load_config()
+    soglia_min = args.min if args.min is not None else cfg["min_threshold"]
+    soglia_max = args.max if args.max is not None else cfg["max_threshold"]
+    intervallo  = args.interval if args.interval is not None else cfg["check_interval"]
+
+    # Salva subito se l'utente ha passato args CLI (così vengono persistiti)
+    if any(v is not None for v in [args.min, args.max, args.interval]):
+        cfg["min_threshold"] = soglia_min
+        cfg["max_threshold"] = soglia_max
+        cfg["check_interval"] = intervallo
+        save_config(cfg)
+
+    # Validazione valori finali
+    if not 1 <= soglia_min <= 99:
+        logger.error("La soglia minima deve essere tra 1 e 99"); sys.exit(1)
+    if not 1 <= soglia_max <= 100:
+        logger.error("La soglia massima deve essere tra 1 e 100"); sys.exit(1)
+    if soglia_min >= soglia_max:
+        logger.error("La soglia minima deve essere inferiore alla soglia massima"); sys.exit(1)
+    if intervallo < 10:
+        logger.error("L'intervallo di controllo deve essere almeno 10 secondi"); sys.exit(1)
+
+    # Mostra configurazione a console (usa un namespace fittizio compatibile con mostra_configurazione)
+    class _Args:
+        min = soglia_min; max = soglia_max; interval = intervallo
+    mostra_configurazione(_Args())
+
     # Verifica che psutil possa leggere la batteria
     try:
         battery = psutil.sensors_battery()
@@ -852,19 +1084,23 @@ def main():
             print("   Il monitor funziona solo su laptop e dispositivi portatili.")
             sys.exit(1)
         else:
-            print(f"\n✅ Batteria rilevata: {battery.percent}% ({'In carica' if battery.power_plugged else 'Non in carica'})")
+            print(f"\n✅ Batteria rilevata: {int(battery.percent)}% ({'In carica' if battery.power_plugged else 'Non in carica'})")
     except Exception as e:
         logger.error(f"❌ Errore nell'accesso alla batteria: {e}")
         sys.exit(1)
-    
-    print(f"\n🚀 Avvio monitor batteria...")
-    print("   Premi Ctrl+C per fermare il monitoraggio")
+
+    print(f"\n🚀 Avvio monitor batteria con system tray...")
+    print(f"   Config salvato in: {CONFIG_PATH}")
+    print("   Premi Ctrl+C o usa 'Esci' dal tray per fermare il monitoraggio")
     print("   I log vengono salvati in 'battery_monitor.log'")
     print("=" * 50)
-    
-    # Crea e avvia il monitor
-    monitor = BatteryMonitor(args.min, args.max, args.interval)
-    
+
+    # Crea monitor e tray
+    monitor = BatteryMonitor(soglia_min, soglia_max, intervallo)
+    tray = BatteryTray(monitor)
+    monitor.tray = tray
+    tray.start()
+
     try:
         monitor.run()
     except KeyboardInterrupt:
@@ -875,6 +1111,8 @@ def main():
         logger.error(f"❌ Errore critico: {e}")
         monitor.stop()
         sys.exit(1)
+    finally:
+        tray.stop()
 
 if __name__ == "__main__":
     main()
