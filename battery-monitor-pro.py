@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 import argparse
 import logging
+import logging.handlers
 import sys
 import json
 import threading
@@ -23,6 +24,23 @@ TIMEOUT_BATTERIA_SCARICA = 90      # Auto-chiudi dopo 90 secondi
 TIMEOUT_BATTERIA_CRITICA = 0       # Mai auto-chiudi se <15%
 AUTO_CLOSE_ON_POWER_CHANGE = True  # Chiudi se cambia alimentazione
 POWER_CHECK_INTERVAL = 2           # Controlla alimentazione ogni 2 secondi
+
+# ========== LOGGING ==========
+# Definito PRIMA di load_config/save_config che usano `logger`.
+# Log in home directory (indipendente dalla CWD) con rotazione per evitare file infiniti.
+LOG_PATH = Path.home() / "battery_monitor.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        ),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ========== CONFIG FILE ==========
 CONFIG_PATH = Path.home() / ".battery_monitor.json"
@@ -59,17 +77,6 @@ def save_config(cfg: dict) -> None:
         logger.info(f"Configurazione salvata in {CONFIG_PATH}")
     except Exception as e:
         logger.error(f"Impossibile salvare il config file: {e}")
-
-# Configurazione del logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("battery_monitor.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
 
 class ModernBatteryPopup:
     def __init__(self, on_snooze=None):
@@ -325,10 +332,10 @@ class ModernBatteryPopup:
                 action_text = f"⚠️ Al {percentuale}%! Scollega il caricatore ORA!"
                 urgency_level = "IMPORTANTE"
             else:
-                status_text = "BATTERIA SOVRACCARICA"
-                action_text = f"🚨 ATTENZIONE! {percentuale}% - SCOLLEGA SUBITO!"
+                status_text = "CARICA PROLUNGATA"
+                action_text = f"🚨 {percentuale}% - Scollega per ridurre l'usura della batteria!"
                 urgency_level = "CRITICO"
-                header_color = "#ff4757"  # Rosso per sovraccarica
+                header_color = "#ff4757"  # Rosso per carica prolungata oltre soglia
         
         # Barra colorata superiore
         header_frame = tk.Frame(main_frame, bg=header_color, height=8)
@@ -464,9 +471,13 @@ class ModernBatteryPopup:
         canvas = tk.Canvas(barra_frame, height=28, bg='#333333', highlightthickness=0)
         canvas.pack(fill='x', padx=10)
 
-        # Larghezza reale del canvas dopo il rendering
-        canvas.update()
-        canvas_width = canvas.winfo_width() or 430
+        # Larghezza reale del canvas dopo il rendering.
+        # Nota: prima della mappatura winfo_width() restituisce 1 (truthy!),
+        # quindi `or 430` non bastava — serve un confronto esplicito.
+        canvas.update_idletasks()
+        canvas_width = canvas.winfo_width()
+        if canvas_width < 50:
+            canvas_width = 410  # 450 finestra - 2*20 padding
 
         # Barra di progresso principale (nella metà inferiore del canvas)
         larghezza_barra = int((percentuale / 100) * canvas_width)
@@ -633,6 +644,12 @@ class ModernBatteryPopup:
     
     def chiudi_popup(self):
         """Chiude il popup con animazione"""
+        # Guard anti ri-entranza: time.sleep + update() processano eventi,
+        # un secondo click durante il fade-out richiamerebbe questo metodo
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
         self.animazione_attiva = False
         self.power_monitor_active = False
         self.countdown_attivo = False
@@ -659,7 +676,8 @@ class ModernBatteryPopup:
         
         self.popup_attiva = False
         self.root = None
-    
+        self._closing = False
+
     def snooze_popup(self):
         """Posticipa il popup di 5 minuti"""
         if self.on_snooze:
@@ -802,11 +820,13 @@ class BatteryMonitor:
             return None
     
     def formatta_tempo_rimasto(self, secondi):
-        """Formatta il tempo rimanente della batteria"""
-        if secondi == -1:
-            return "In carica"
-        elif secondi == -2:
+        """Formatta il tempo rimanente della batteria.
+        Nota: psutil.POWER_TIME_UNKNOWN == -1, psutil.POWER_TIME_UNLIMITED == -2
+        (nel codice originale erano invertiti)."""
+        if secondi is None or secondi == psutil.POWER_TIME_UNKNOWN:
             return "Sconosciuto"
+        elif secondi == psutil.POWER_TIME_UNLIMITED:
+            return "In carica"
         else:
             ore = secondi // 3600
             minuti = (secondi % 3600) // 60
@@ -934,9 +954,15 @@ class BatteryMonitor:
             logger.info(f"Nuove impostazioni: min={self.soglia_min}% max={self.soglia_max}% intervallo={self.intervallo}s")
 
     def run(self):
-        """Esegue il monitoraggio della batteria"""
+        """Esegue il monitoraggio della batteria.
+        Il loop dorme a tick brevi (0.5s) invece di un unico sleep lungo:
+        così 'Esci' e 'Impostazioni' dal tray rispondono subito,
+        non dopo (fino a) `intervallo` secondi."""
         logger.info(f"Monitor batteria avviato - Soglie: {self.soglia_min}%-{self.soglia_max}% - Intervallo: {self.intervallo}s")
-        logger.info(f"Promemoria progressivi: ogni PROGRESSIVE_REMINDER_STEP% sopra {self.soglia_max}%")
+        logger.info(f"Promemoria progressivi: ogni {PROGRESSIVE_REMINDER_STEP}% sopra {self.soglia_max}%")
+
+        TICK = 0.5
+        prossimo_controllo = 0.0  # primo controllo immediato
 
         while self.running:
             # Apertura dialogo impostazioni richiesta dal tray (deve stare nel main thread)
@@ -944,19 +970,36 @@ class BatteryMonitor:
                 self.show_settings = False
                 self._apri_dialogo_impostazioni()
 
-            if not self.paused:
+            if not self.paused and time.time() >= prossimo_controllo:
                 self.controlla_batteria()
                 if self.tray and self._last_battery:
                     self.tray.update(
                         self._last_battery["percentuale"],
                         self._last_battery["alimentazione"],
                     )
+                prossimo_controllo = time.time() + self.intervallo
 
-            time.sleep(self.intervallo)
+            time.sleep(TICK)
     
     def stop(self):
         """Ferma il monitoraggio"""
         self.running = False
+
+_instance_lock_socket = None  # riferimento globale: il socket deve vivere quanto il processo
+
+def acquire_single_instance_lock(port: int = 47821) -> bool:
+    """Impedisce l'avvio di una seconda istanza del monitor.
+    Usa un bind su porta localhost: cross-platform, si rilascia
+    automaticamente anche in caso di crash (a differenza di un lockfile)."""
+    global _instance_lock_socket
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", port))
+        _instance_lock_socket = s
+        return True
+    except OSError:
+        return False
 
 def parse_arguments():
     """Gestisce gli argomenti da linea di comando.
@@ -1043,6 +1086,10 @@ def main():
     """Funzione principale"""
     args = parse_arguments()
 
+    if not acquire_single_instance_lock():
+        print("⚠️  Il monitor batteria è già in esecuzione. Uscita.")
+        sys.exit(0)
+
     if args.test:
         test_demo()
         return
@@ -1053,14 +1100,8 @@ def main():
     soglia_max = args.max if args.max is not None else cfg["max_threshold"]
     intervallo  = args.interval if args.interval is not None else cfg["check_interval"]
 
-    # Salva subito se l'utente ha passato args CLI (così vengono persistiti)
-    if any(v is not None for v in [args.min, args.max, args.interval]):
-        cfg["min_threshold"] = soglia_min
-        cfg["max_threshold"] = soglia_max
-        cfg["check_interval"] = intervallo
-        save_config(cfg)
-
-    # Validazione valori finali
+    # Validazione valori finali — PRIMA di persistere, così valori CLI
+    # invalidi non finiscono mai nel config file
     if not 1 <= soglia_min <= 99:
         logger.error("La soglia minima deve essere tra 1 e 99"); sys.exit(1)
     if not 1 <= soglia_max <= 100:
@@ -1069,6 +1110,13 @@ def main():
         logger.error("La soglia minima deve essere inferiore alla soglia massima"); sys.exit(1)
     if intervallo < 10:
         logger.error("L'intervallo di controllo deve essere almeno 10 secondi"); sys.exit(1)
+
+    # Salva solo se l'utente ha passato args CLI validi (così vengono persistiti)
+    if any(v is not None for v in [args.min, args.max, args.interval]):
+        cfg["min_threshold"] = soglia_min
+        cfg["max_threshold"] = soglia_max
+        cfg["check_interval"] = intervallo
+        save_config(cfg)
 
     # Mostra configurazione a console (usa un namespace fittizio compatibile con mostra_configurazione)
     class _Args:
@@ -1092,7 +1140,7 @@ def main():
     print(f"\n🚀 Avvio monitor batteria con system tray...")
     print(f"   Config salvato in: {CONFIG_PATH}")
     print("   Premi Ctrl+C o usa 'Esci' dal tray per fermare il monitoraggio")
-    print("   I log vengono salvati in 'battery_monitor.log'")
+    print(f"   I log vengono salvati in '{LOG_PATH}'")
     print("=" * 50)
 
     # Crea monitor e tray
